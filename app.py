@@ -313,7 +313,13 @@ else:
 
 # ---------- signal card ----------
 if sig["action"] == "NO TRADE":
-    st.warning(f"**NO TRADE** - {sig['reason']}")
+    WHY = {"Market open": "Market is closed",
+           "Entry window (9:30-15:00 IST)": "outside the 9:30-15:00 IST entry window",
+           "Trend is one-sided": "5-min trend is sideways",
+           "OI agrees with trend": "OI does not agree with the trend",
+           "Global cues not against": "global cues are against the trend"}
+    fails = [WHY.get(c["check"], c["check"]) for c in sig["checks"] if not c["ok"]]
+    st.warning("**NO TRADE** - " + ("; ".join(fails) if fails else sig["reason"]))
 else:
     L = sig["levels"]
     side, mult = sig["side"], (0 if strike_pref == "ATM" else 1)
@@ -342,15 +348,20 @@ with t1:
     d = tr["df"]
     if d is not None and len(d) > 5:
         d = d.iloc[-150:]
-        fig = go.Figure(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low, close=d.close, name=name))
+        xs = list(d.index.strftime("%d %b %H:%M"))
+        fig = go.Figure(go.Candlestick(x=xs, open=d.open, high=d.high, low=d.low, close=d.close, name=name))
         if "ema20" in d:
-            fig.add_scatter(x=d.index, y=d.ema20, name="EMA20")
-            fig.add_scatter(x=d.index, y=d.ema50, name="EMA50")
-        for lvl, nm in ((summ["support"], "OI support"), (summ["resistance"], "OI resistance")):
-            if lvl == lvl:
-                fig.add_hline(y=lvl, line_dash="dot", annotation_text=nm)
-        fig.update_layout(height=420, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=10, b=0))
-        fig.update_xaxes(type="category", showticklabels=False)
+            fig.add_scatter(x=xs, y=d.ema20, name="EMA20")
+            fig.add_scatter(x=xs, y=d.ema50, name="EMA50")
+        if summ["resistance"] == summ["resistance"]:
+            fig.add_hline(y=summ["resistance"], line_dash="dot", line_color="#d9534f",
+                          annotation_text=f"R {summ['resistance']:.0f}", annotation_position="top left")
+        if summ["support"] == summ["support"]:
+            fig.add_hline(y=summ["support"], line_dash="dot", line_color="#2e8b57",
+                          annotation_text=f"S {summ['support']:.0f}", annotation_position="bottom left")
+        fig.update_layout(height=460, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=10, b=0),
+                          legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0))
+        fig.update_xaxes(type="category", tickmode="array", tickvals=xs[::30], ticktext=xs[::30], tickangle=-45)
         st.plotly_chart(fig, use_container_width=True)
     st.write(f"5-min trend: **{tr['label']}**")
 with t2:

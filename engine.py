@@ -207,3 +207,138 @@ def option_levels(sig, opt_ltp, opt_delta):
     sgn = 1 if sig["side"] == "CE" else -1
     f = lambda lvl: opt_ltp + d * sgn * (lvl - L["entry"])
     return dict(entry=opt_ltp, sl=max(0.05, f(L["sl"])), t1=f(L["t1"]), t2=f(L["t2"]))
+
+
+# =====================================================================
+# Per-strike OI build-up detection (CE/PE long build-up, short covering ...)
+# =====================================================================
+import datetime as _dt
+
+STATE_NAME = {"LB": "Long buildup", "SB": "Short buildup", "SC": "Short covering",
+              "LU": "Long unwinding", "-": "No clear change"}
+
+
+def classify(dp, doi, thr_p=2.0, thr_oi=2.0):
+    """dp, doi are % changes of option price and OI."""
+    if abs(dp) < thr_p or abs(doi) < thr_oi:
+        return "-"
+    if dp > 0 and doi > 0:
+        return "LB"
+    if dp < 0 and doi > 0:
+        return "SB"
+    if dp > 0 and doi < 0:
+        return "SC"
+    return "LU"
+
+
+def pick_reference(snaps, now, lookback_min):
+    """Return (reference snapshot, has_full_lookback). None if not enough history yet."""
+    if len(snaps) < 2:
+        return None, False
+    target = now - _dt.timedelta(minutes=lookback_min)
+    older = [s for s in snaps if s["t"] <= target]
+    ref = older[-1] if older else snaps[0]
+    if (now - ref["t"]).total_seconds() < 60:
+        return None, False
+    return ref, bool(older)
+
+
+BU_COLS = ["strike", "side", "ltp", "dp", "doi", "d_oi", "state"]
+
+
+def buildup_analysis(chain, ref, atm, step, window=3, thr_p=2.0, thr_oi=2.0):
+    rows = []
+    if ref is None:
+        return pd.DataFrame(columns=BU_COLS)
+    rc = ref["chain"]
+    for k in chain.index:
+        if abs(k - atm) > window * step + 1e-9 or k not in rc.index:
+            continue
+        for side in ("ce", "pe"):
+            p0, o0 = rc.at[k, f"{side}_ltp"], rc.at[k, f"{side}_oi"]
+            p1, o1 = chain.at[k, f"{side}_ltp"], chain.at[k, f"{side}_oi"]
+            if not (p0 == p0 and o0 == o0 and p1 == p1 and o1 == o1) or p0 <= 0 or o0 <= 0:
+                continue
+            dp, doi = (p1 / p0 - 1) * 100, (o1 / o0 - 1) * 100
+            rows.append(dict(strike=float(k), side=side.upper(), ltp=float(p1), dp=dp, doi=doi,
+                             d_oi=float(o1 - o0), state=classify(dp, doi, thr_p, thr_oi)))
+    return pd.DataFrame(rows, columns=BU_COLS)
+
+
+def side_states(df):
+    """Dominant build-up state per side (weighted by absolute OI change) and its strongest strike."""
+    out = {}
+    for side in ("CE", "PE"):
+        d = df[(df["side"] == side) & (df["state"] != "-")] if len(df) else df
+        if len(d) == 0:
+            out[side] = dict(state="-", strike=float("nan"), share=0.0, n=0)
+            continue
+        w = d.assign(w=d["d_oi"].abs()).groupby("state")["w"].sum()
+        top = w.idxmax()
+        share = float(w.max() / w.sum()) if w.sum() > 0 else 0.0
+        dd = d[d["state"] == top]
+        best = float(dd.loc[dd["d_oi"].abs().idxmax(), "strike"])
+        out[side] = dict(state=top if share >= 0.5 else "-", strike=best, share=share, n=int(len(dd)))
+    return out
+
+
+def index_levels(side, spot, swing_low, swing_high, support, resistance, min_rr=1.5):
+    """Index-level entry / SL / targets. Returns (levels or None, reason)."""
+    if side == "CE":
+        c = [x for x in (swing_low, support) if x == x and x < spot * (1 - 0.0025)]
+        sl = max(c) if c else spot * (1 - 0.004)
+        r = spot - sl
+        if resistance == resistance and 0 < resistance - spot < min_rr * r:
+            return None, f"Call OI wall {resistance:.0f} too close for {min_rr}R reward"
+        return dict(entry=spot, sl=sl, t1=spot + 1.5 * r, t2=spot + 2.5 * r, risk=r), ""
+    c = [x for x in (swing_high, resistance) if x == x and x > spot * (1 + 0.0025)]
+    sl = min(c) if c else spot * (1 + 0.004)
+    r = sl - spot
+    if support == support and 0 < spot - support < min_rr * r:
+        return None, f"Put OI wall {support:.0f} too close for {min_rr}R reward"
+    return dict(entry=spot, sl=sl, t1=spot - 1.5 * r, t2=spot - 2.5 * r, risk=r), ""
+
+
+def buildup_signal(sides, rule, spot, atm, step, trend, summ, live, chain):
+    ce, pe = sides["CE"], sides["PE"]
+    res = dict(side=None, action="NO SIGNAL", reason="", strike=None, idx=None, opt=None,
+               ce=ce, pe=pe, exits=[])
+    if not live:
+        res["reason"] = "Market closed or outside 9:30-15:00 IST window"
+        return res
+    side = None
+    if rule == "My rule":
+        if ce["state"] == "LB" and pe["state"] == "SC":
+            side = "CE"
+        elif pe["state"] == "SB" and ce["state"] == "LU":
+            side = "PE"
+    else:
+        if ce["state"] in ("LB", "SC") and pe["state"] in ("SB", "LU"):
+            side = "CE"
+        elif pe["state"] in ("LB", "SC") and ce["state"] in ("SB", "LU"):
+            side = "PE"
+    if side is None:
+        res["reason"] = (f"Pattern not formed. CE: {STATE_NAME[ce['state']]}, PE: {STATE_NAME[pe['state']]}")
+        return res
+    pattern_strike = ce["strike"] if side == "CE" else pe["strike"]
+    strike = min(max(pattern_strike, atm - step), atm + step)
+    if strike not in chain.index:
+        strike = atm
+    lv, why = index_levels(side, spot, trend.get("swing_low", float("nan")), trend.get("swing_high", float("nan")),
+                           summ["support"], summ["resistance"])
+    if lv is None:
+        res["reason"] = "Pattern formed but " + why
+        return res
+    ltp = float(chain.at[strike, f"{side.lower()}_ltp"])
+    dlt = float(chain.at[strike, f"{side.lower()}_delta"])
+    opt = option_levels(dict(side=side, levels=lv), ltp, dlt)
+    res.update(side=side, action=f"BUY {side}", strike=float(strike), idx=lv, opt=opt,
+               pattern_strike=float(pattern_strike), reason="Pattern confirmed",
+               exits=[
+                   f"SL: exit if a 5-min candle closes beyond index {lv['sl']:.0f} (option about {opt['sl']:.1f}).",
+                   f"T1 {lv['t1']:.0f} (option about {opt['t1']:.1f}): book half, move SL to entry.",
+                   f"T2 {lv['t2']:.0f} (option about {opt['t2']:.1f}): exit the rest.",
+                   "Exit early if the opposite build-up pattern appears.",
+                   "Time exit by 15:15 IST; avoid holding through event risk.",
+               ])
+    return res

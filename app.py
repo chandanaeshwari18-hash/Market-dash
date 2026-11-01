@@ -12,6 +12,7 @@ from kiteconnect import KiteConnect
 from streamlit_autorefresh import st_autorefresh
 
 import engine as E
+import sheets_log as SL
 
 IST = ZoneInfo("Asia/Kolkata")
 st.set_page_config(page_title="Market Dashboard", layout="wide", initial_sidebar_state="collapsed")
@@ -153,6 +154,11 @@ with st.sidebar:
     gift = st.number_input("Gift Nifty change % (type from your app, 0 = ignore)", value=0.0, step=0.1)
     refresh = st.selectbox("Auto refresh (sec)", [30, 60, 120, 0], index=1)
     block_expiry = st.checkbox("No signals on expiry day", value=False)
+    rule = st.radio("Build-up rule", ["My rule", "Standard"],
+                    help="My rule: CE long buildup + PE short covering = BUY CE; PE short buildup + CE long unwinding = BUY PE. "
+                         "Standard: bullish = CE (long buildup/short covering) with PE (short buildup/long unwinding); bearish is the mirror.")
+    lookback = st.selectbox("Build-up lookback (min)", [5, 15, 30, 60], index=1)
+    confirm_n = st.number_input("Confirm after N refreshes", 1, 5, 2)
 
 cfg = UND[name]
 t = now()
@@ -204,6 +210,56 @@ is_expiry_day = expiry == t.date()
 sig = E.make_signal(spot, tr, odir, gdir, summ["support"], summ["resistance"],
                     in_window and not (block_expiry and is_expiry_day), market_open)
 
+# ---------- per-strike build-up signal ----------
+snaps = S.setdefault("snaps", {}).setdefault(bkey, [])
+if not snaps or (t - snaps[-1]["t"]).total_seconds() >= 20:
+    snaps.append(dict(t=t, chain=chain[["ce_ltp", "pe_ltp", "ce_oi", "pe_oi"]].copy()))
+    del snaps[:-500]
+ref, ref_full = E.pick_reference(snaps, t, lookback)
+bu_df = E.buildup_analysis(chain, ref, atm, cfg["step"], 3)
+bu_sides = E.side_states(bu_df)
+bsig = E.buildup_signal(bu_sides, rule, spot, atm, cfg["step"], tr, summ,
+                        in_window and not (block_expiry and is_expiry_day), chain)
+c_side, c_n = S.get("bu_conf", (None, 0))
+if bsig["side"]:
+    c_n = c_n + 1 if c_side == bsig["side"] else 1
+    c_side = bsig["side"]
+else:
+    c_side, c_n = None, 0
+S["bu_conf"] = (c_side, c_n)
+bu_confirmed = bool(bsig["side"]) and c_n >= confirm_n
+fired = S.setdefault("fired", [])
+new_alert = False
+today = t.strftime("%Y-%m-%d")
+if SL.enabled() and S.get("sheet_day") != today:  # after a restart, reload today's alerts so they are not repeated
+    S["sheet_day"] = today
+    for r in SL.read_alerts():
+        if str(r.get("date")) == today:
+            try:
+                fk0 = (today, r.get("index"), str(r.get("action", "")).replace("BUY ", ""), float(r.get("strike")))
+            except Exception:
+                continue
+            if not any(f["key"] == fk0 for f in fired):
+                fired.append(dict(key=fk0, time=r.get("time"), index=r.get("index"), action=r.get("action"),
+                                  strike=r.get("strike"), entry=r.get("entry"), sl=r.get("sl"),
+                                  t1=r.get("t1"), t2=r.get("t2")))
+if bu_confirmed:
+    fk = (t.strftime("%Y-%m-%d"), name, bsig["side"], bsig["strike"])
+    if not any(f["key"] == fk for f in fired):
+        fired.append(dict(key=fk, time=t.strftime("%H:%M:%S"), index=name, action=bsig["action"],
+                          strike=bsig["strike"], entry=bsig["opt"]["entry"], sl=bsig["opt"]["sl"],
+                          t1=bsig["opt"]["t1"], t2=bsig["opt"]["t2"]))
+        new_alert = True
+        if SL.enabled():
+            ok, err = SL.append_alert(dict(date=today, time=t.strftime("%H:%M:%S"), index=name, expiry=str(expiry),
+                                           action=bsig["action"], strike=bsig["strike"],
+                                           entry=round(bsig["opt"]["entry"], 1), sl=round(bsig["opt"]["sl"], 1),
+                                           t1=round(bsig["opt"]["t1"], 1), t2=round(bsig["opt"]["t2"], 1)))
+            if not ok:
+                st.warning(f"Could not write to Google Sheet: {err}")
+            else:
+                SL.read_alerts.clear()
+
 # ---------- header ----------
 st.caption(f"{t.strftime('%a %d %b %Y %H:%M:%S')} IST | {'MARKET OPEN' if market_open else 'MARKET CLOSED (last data)'}"
            f" | OI baseline taken {b['at']} | trend data: {hsrc}")
@@ -212,6 +268,48 @@ c1.metric(name, f"{spot:,.1f}")
 c2.metric("PCR", f"{summ['pcr']:.2f}")
 c3.metric("OI support / resistance", f"{summ['support']:.0f} / {summ['resistance']:.0f}")
 c4.metric("Max pain", f"{summ['max_pain']:.0f}")
+
+# ---------- build-up signal card ----------
+if new_alert:
+    st.toast(f"{bsig['action']} {name} {bsig['strike']:.0f}", icon="🔔")
+    import streamlit.components.v1 as components
+    components.html("<script>try{const c=new (window.AudioContext||window.webkitAudioContext)();"
+                    "const o=c.createOscillator();o.connect(c.destination);o.frequency.value=880;"
+                    "o.start();setTimeout(()=>o.stop(),700);}catch(e){}</script>", height=0)
+ce_s, pe_s = bsig["ce"], bsig["pe"]
+st.caption(f"Build-up ({rule}, lookback {lookback} min{'' if ref_full or ref is None else ', short history so far'}): "
+           f"CE = {E.STATE_NAME[ce_s['state']]} | PE = {E.STATE_NAME[pe_s['state']]}")
+if bsig["side"] and bu_confirmed:
+    (st.success if bsig["side"] == "CE" else st.error)(
+        f"**BUILD-UP SIGNAL: {bsig['action']} - {name} {bsig['strike']:.0f} {bsig['side']} ({expiry})**")
+    o, ix = bsig["opt"], bsig["idx"]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Entry (premium)", f"{o['entry']:.1f}")
+    m2.metric("Stop loss", f"{o['sl']:.1f}")
+    m3.metric("Target 1", f"{o['t1']:.1f}")
+    m4.metric("Target 2", f"{o['t2']:.1f}")
+    st.write(f"Index: entry {ix['entry']:.0f}, SL {ix['sl']:.0f}, T1 {ix['t1']:.0f}, T2 {ix['t2']:.0f}. "
+             f"Pattern strongest at strike {bsig['pattern_strike']:.0f}.")
+    for line in bsig["exits"]:
+        st.write("- " + line)
+elif bsig["side"]:
+    st.info(f"Pattern forming for {bsig['action']} - waiting for confirmation ({c_n}/{confirm_n}).")
+else:
+    st.warning(f"No build-up signal - {bsig['reason']}")
+if fired:
+    with st.expander(f"Today's build-up alerts ({len([f for f in fired if f['key'][0] == t.strftime('%Y-%m-%d')])})"):
+        st.dataframe(pd.DataFrame([{k: v for k, v in f.items() if k != "key"} for f in fired[::-1]]),
+                     hide_index=True, use_container_width=True)
+
+if SL.enabled():
+    with st.expander("All past alerts (Google Sheet)"):
+        past = SL.read_alerts()
+        if past:
+            st.dataframe(pd.DataFrame(past).iloc[::-1], hide_index=True, use_container_width=True)
+        else:
+            st.write("No alerts logged yet (or the sheet could not be read).")
+else:
+    st.caption("Google Sheet logging is off (add SHEET_ID and gcp_service_account to Secrets to turn it on).")
 
 # ---------- signal card ----------
 if sig["action"] == "NO TRADE":
@@ -239,7 +337,7 @@ with st.expander("Why? (checklist)", expanded=sig["action"] == "NO TRADE"):
     st.write(f"Global score {gscore:+.2f} (Gift Nifty {'included' if gift else 'not included'})")
 
 # ---------- tabs ----------
-t1, t2, t3, t4 = st.tabs(["Chart", "Option chain", "OI chart", "Global"])
+t1, t2, t3, t4, t5 = st.tabs(["Chart", "Option chain", "OI chart", "Global", "Build-up"])
 with t1:
     d = tr["df"]
     if d is not None and len(d) > 5:
@@ -271,5 +369,16 @@ with t3:
 with t4:
     st.dataframe(gdf, hide_index=True, use_container_width=True)
     st.caption("Daily change from Yahoo Finance (can lag). Yield change in basis points. Gift Nifty: enter in sidebar.")
+
+with t5:
+    if len(bu_df):
+        v = bu_df.copy()
+        v["state"] = v["state"].map(E.STATE_NAME)
+        v = v.rename(columns={"dp": "price chg %", "doi": "OI chg %", "d_oi": "OI chg"}).round(2)
+        st.dataframe(v.sort_values(["side", "strike"]), hide_index=True, use_container_width=True, height=480)
+        st.caption("Price and OI change compared with the snapshot taken about the lookback minutes ago (ATM +/- 3 strikes). "
+                   "A change under 2% counts as no clear change. History resets if the server restarts.")
+    else:
+        st.info("Collecting snapshots - build-up needs at least a minute of history.")
 
 st.caption("Educational analysis only. Not investment advice. Read-only: this app cannot place orders.")
